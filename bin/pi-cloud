@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+REMOTE_NAME="${PI_CLOUD_REMOTE:-gdrive}"
+REMOTE_ROOT="${PI_CLOUD_ROOT:-AI-Agent-Sessions}"
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: pi-cloud must be run inside a Git repository."
+  exit 1
+}
+
+PROJECT_NAME="${PI_CLOUD_PROJECT_NAME:-$(basename "$PROJECT_ROOT")}"
+
+if [[ "${CODESPACES:-}" == "true" ]]; then
+  ENV_NAME="GitHub Codespaces"
+  SESSION_ROOT="/workspaces/.pi-sync"
+  AGENT_DIR="/workspaces/.private/pi-agent"
+  RCLONE_CONFIG_FILE="/workspaces/.private/rclone/rclone.conf"
+
+  mkdir -p "$SESSION_ROOT" "$AGENT_DIR" "$(dirname "$RCLONE_CONFIG_FILE")"
+  chmod 700 /workspaces/.private "$AGENT_DIR" "$(dirname "$RCLONE_CONFIG_FILE")" 2>/dev/null || true
+
+  # Restore the rclone config from a Codespaces secret when necessary.
+  if [[ ! -s "$RCLONE_CONFIG_FILE" && -n "${RCLONE_CONFIG_B64:-}" ]]; then
+    if ! printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RCLONE_CONFIG_FILE"; then
+      rm -f "$RCLONE_CONFIG_FILE"
+      echo "Error: failed to decode RCLONE_CONFIG_B64."
+      exit 1
+    fi
+    chmod 600 "$RCLONE_CONFIG_FILE"
+  fi
+
+  if [[ ! -s "$RCLONE_CONFIG_FILE" ]]; then
+    echo "Error: Codespaces rclone config is missing:"
+    echo "  $RCLONE_CONFIG_FILE"
+    echo "Set the Codespaces secret RCLONE_CONFIG_B64 and restart the Codespace."
+    exit 1
+  fi
+
+  RCLONE_ARGS=(--config "$RCLONE_CONFIG_FILE")
+else
+  ENV_NAME="Local Linux/WSL"
+  SESSION_ROOT="${PI_CLOUD_SESSION_ROOT:-$HOME/.pi-sync}"
+  AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  RCLONE_ARGS=()
+fi
+
+SESSION_DIR="$SESSION_ROOT/$PROJECT_NAME"
+REMOTE="$REMOTE_NAME:$REMOTE_ROOT/$PROJECT_NAME/pi"
+
+mkdir -p "$SESSION_DIR" "$AGENT_DIR"
+
+if ! command -v rclone >/dev/null 2>&1; then
+  echo "Error: rclone is not installed or not in PATH."
+  exit 1
+fi
+
+if ! command -v pi >/dev/null 2>&1; then
+  echo "Error: Pi coding agent is not installed or not in PATH."
+  exit 1
+fi
+
+export PI_CODING_AGENT_DIR="$AGENT_DIR"
+
+cat <<EOF
+
+========================================
+ Pi Cloud
+========================================
+Environment : $ENV_NAME
+Project     : $PROJECT_NAME
+Repository  : $PROJECT_ROOT
+Session Dir : $SESSION_DIR
+Cloud       : $REMOTE
+========================================
+EOF
+
+# Make sure the project's cloud directory exists.
+echo
+echo "Preparing cloud session folder..."
+if ! rclone "${RCLONE_ARGS[@]}" mkdir "$REMOTE"; then
+  echo "Error: cannot access or create the cloud session folder."
+  exit 1
+fi
+
+# Pull before opening Pi. --update avoids replacing a newer local file with an older cloud copy.
+echo
+echo "Pulling latest Pi sessions..."
+if ! rclone "${RCLONE_ARGS[@]}" copy --update "$REMOTE" "$SESSION_DIR"; then
+  echo "Error: session pull failed. Pi will not start."
+  exit 1
+fi
+
+echo "Pull complete."
+
+READY_TO_PUSH=1
+
+push_sessions() {
+  if [[ "${READY_TO_PUSH:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  echo
+  echo "Uploading Pi sessions..."
+  if rclone "${RCLONE_ARGS[@]}" copy --update "$SESSION_DIR" "$REMOTE"; then
+    echo "Session sync complete."
+    return 0
+  fi
+
+  echo "WARNING: session upload failed."
+  echo "Your local sessions are still safe at:"
+  echo "  $SESSION_DIR"
+  return 1
+}
+
+on_exit() {
+  local status=$?
+  local sync_status=0
+
+  trap - EXIT
+  push_sessions || sync_status=$?
+
+  if [[ $status -eq 0 && $sync_status -ne 0 ]]; then
+    status=$sync_status
+  fi
+
+  exit "$status"
+}
+
+# Best effort: normal /quit, Ctrl+C, and most shell exits will still upload sessions.
+trap on_exit EXIT
+
+cd "$PROJECT_ROOT"
+
+echo
+echo "Starting Pi..."
+echo
+
+if [[ "${1:-}" == "new" ]]; then
+  shift
+  pi --session-dir "$SESSION_DIR" "$@"
+else
+  if find "$SESSION_DIR" -maxdepth 1 -type f -name '*.jsonl' -print -quit | grep -q .; then
+    pi --session-dir "$SESSION_DIR" -r "$@"
+  else
+    pi --session-dir "$SESSION_DIR" "$@"
+  fi
+fi
